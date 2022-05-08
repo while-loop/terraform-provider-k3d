@@ -3,22 +3,23 @@ package provider
 import (
 	"context"
 	"fmt"
+	"github.com/k3d-io/k3d/v5/pkg/config/v1alpha4"
 	"log"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	configtypes "github.com/k3d-io/k3d/v5/pkg/config/types"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	"github.com/rancher/k3d/v4/cmd/util"
-	"github.com/rancher/k3d/v4/pkg/client"
-	"github.com/rancher/k3d/v4/pkg/config"
-	"github.com/rancher/k3d/v4/pkg/config/v1alpha2"
-	"github.com/rancher/k3d/v4/pkg/runtimes"
-	"github.com/rancher/k3d/v4/pkg/types"
-	"github.com/rancher/k3d/v4/version"
+	"github.com/k3d-io/k3d/v5/cmd/util"
+	"github.com/k3d-io/k3d/v5/pkg/client"
+	"github.com/k3d-io/k3d/v5/pkg/config"
+	"github.com/k3d-io/k3d/v5/pkg/runtimes"
+	"github.com/k3d-io/k3d/v5/pkg/types"
+	"github.com/k3d-io/k3d/v5/version"
 )
 
 func resourceCluster() *schema.Resource {
@@ -106,7 +107,7 @@ func resourceCluster() *schema.Resource {
 				ForceNew:    true,
 				Optional:    true,
 				Type:        schema.TypeString,
-				Default:     fmt.Sprintf("%s:%s", types.DefaultK3sImageRepo, version.GetK3sVersion(false)),
+				Default:     fmt.Sprintf("%s:%s", types.DefaultK3sImageRepo, version.K3sVersion),
 			},
 			"k3d": {
 				Description: "k3d runtime settings.",
@@ -406,22 +407,30 @@ func resourceClusterCreate(ctx context.Context, d *schema.ResourceData, meta int
 	clusterName := d.Get("name").(string)
 
 	// TODO: validate all values with GetOk
-	simpleConfig := &v1alpha2.SimpleConfig{
-		Name:         clusterName,
+	simpleConfig := &v1alpha4.SimpleConfig{
+		TypeMeta:     configtypes.TypeMeta{},
+		ObjectMeta:   configtypes.ObjectMeta{Name: clusterName},
 		Agents:       d.Get("agents").(int),
 		ClusterToken: d.Get("token").(string),
 		Env:          expandEnvVars(d.Get("env").([]interface{})),
 		ExposeAPI:    expandExposureOptions(d.Get("kube_api").([]interface{})),
 		Image:        d.Get("image").(string),
-		Labels:       expandLabels(d.Get("label").([]interface{})),
-		Network:      d.Get("network").(string),
-		Ports:        expandPorts(d.Get("port").([]interface{})),
-		Servers:      d.Get("servers").(int),
+		Options: v1alpha4.SimpleConfigOptions{
+			K3dOptions: v1alpha4.SimpleConfigOptionsK3d{},
+			K3sOptions: v1alpha4.SimpleConfigOptionsK3s{
+				NodeLabels: expandLabels(d.Get("label").([]interface{})),
+			},
+			KubeconfigOptions: v1alpha4.SimpleConfigOptionsKubeconfig{},
+			Runtime:           v1alpha4.SimpleConfigOptionsRuntime{},
+		},
+		Network: d.Get("network").(string),
+		Ports:   expandPorts(d.Get("port").([]interface{})),
+		Servers: d.Get("servers").(int),
 		//Subnet:       d.Get("subnet").(string),
 		Volumes: expandVolumes(d.Get("volume").([]interface{})),
 	}
 
-	simpleConfig.Options = v1alpha2.SimpleConfigOptions{
+	simpleConfig.Options = v1alpha4.SimpleConfigOptions{
 		K3dOptions:        expandConfigOptionsK3d(d.Get("k3d").([]interface{})),
 		K3sOptions:        expandConfigOptionsK3s(d.Get("k3s").([]interface{})),
 		KubeconfigOptions: expandConfigOptionsKubeconfig(d.Get("kubeconfig").([]interface{})),
@@ -432,7 +441,7 @@ func resourceClusterCreate(ctx context.Context, d *schema.ResourceData, meta int
 	if len(l) != 0 && l[0] != nil {
 		v := l[0].(map[string]interface{})
 		simpleConfig.Registries.Config = v["config"].(string)
-		simpleConfig.Registries.Create = v["create"].(bool)
+		//simpleConfig.Registries.Create = v["create"].(bool) todo
 
 		use := make([]string, 0, len(v["use"].([]interface{})))
 		for _, i := range v["use"].([]interface{}) {
@@ -533,8 +542,8 @@ func resourceClusterDelete(ctx context.Context, d *schema.ResourceData, meta int
 	return nil
 }
 
-func expandConfigOptionsK3d(l []interface{}) v1alpha2.SimpleConfigOptionsK3d {
-	opts := v1alpha2.SimpleConfigOptionsK3d{
+func expandConfigOptionsK3d(l []interface{}) v1alpha4.SimpleConfigOptionsK3d {
+	opts := v1alpha4.SimpleConfigOptionsK3d{
 		NoRollback: false,
 		Timeout:    0,
 		Wait:       true,
@@ -547,68 +556,71 @@ func expandConfigOptionsK3d(l []interface{}) v1alpha2.SimpleConfigOptionsK3d {
 	in := l[0].(map[string]interface{})
 	opts.DisableImageVolume = in["disable_image_volume"].(bool)
 	opts.DisableLoadbalancer = in["disable_load_balancer"].(bool)
-	opts.PrepDisableHostIPInjection = in["disable_host_ip_injection"].(bool)
 
 	return opts
 }
 
-func expandConfigOptionsK3s(l []interface{}) v1alpha2.SimpleConfigOptionsK3s {
+func expandConfigOptionsK3s(l []interface{}) v1alpha4.SimpleConfigOptionsK3s {
 	if len(l) == 0 || l[0] == nil {
-		return v1alpha2.SimpleConfigOptionsK3s{}
+		return v1alpha4.SimpleConfigOptionsK3s{}
 	}
 
 	v := l[0].(map[string]interface{})
-
-	extraAgentArgs := make([]string, 0, len(v["extra_agent_args"].([]interface{})))
+	extraArgs := make([]v1alpha4.K3sArgWithNodeFilters, 0)
 	for _, i := range v["extra_agent_args"].([]interface{}) {
-		extraAgentArgs = append(extraAgentArgs, i.(string))
+		extraArgs = append(extraArgs, v1alpha4.K3sArgWithNodeFilters{
+			Arg:         i.(string),
+			NodeFilters: []string{"agent[*]"},
+		})
 	}
 
-	extraServerArgs := make([]string, 0, len(v["extra_server_args"].([]interface{})))
 	for _, i := range v["extra_server_args"].([]interface{}) {
-		extraServerArgs = append(extraServerArgs, i.(string))
+		extraArgs = append(extraArgs, v1alpha4.K3sArgWithNodeFilters{
+			Arg:         i.(string),
+			NodeFilters: []string{"server[*]"},
+		})
 	}
 
-	return v1alpha2.SimpleConfigOptionsK3s{
-		ExtraAgentArgs:  extraAgentArgs,
-		ExtraServerArgs: extraServerArgs,
+	return v1alpha4.SimpleConfigOptionsK3s{
+		ExtraArgs: extraArgs,
+		//NodeLabels: expandLabels(v.Get("label").([]interface{})), // todo
 	}
 }
 
-func expandConfigOptionsKubeconfig(l []interface{}) v1alpha2.SimpleConfigOptionsKubeconfig {
+func expandConfigOptionsKubeconfig(l []interface{}) v1alpha4.SimpleConfigOptionsKubeconfig {
 	if len(l) == 0 || l[0] == nil {
-		return v1alpha2.SimpleConfigOptionsKubeconfig{}
+		return v1alpha4.SimpleConfigOptionsKubeconfig{}
 	}
 
 	v := l[0].(map[string]interface{})
-	return v1alpha2.SimpleConfigOptionsKubeconfig{
+	return v1alpha4.SimpleConfigOptionsKubeconfig{
 		SwitchCurrentContext:    v["switch_current_context"].(bool),
 		UpdateDefaultKubeconfig: v["update_default_kubeconfig"].(bool),
 	}
 }
 
-func expandConfigOptionsRuntime(l []interface{}) v1alpha2.SimpleConfigOptionsRuntime {
+func expandConfigOptionsRuntime(l []interface{}) v1alpha4.SimpleConfigOptionsRuntime {
 	if len(l) == 0 || l[0] == nil {
-		return v1alpha2.SimpleConfigOptionsRuntime{}
+		return v1alpha4.SimpleConfigOptionsRuntime{}
 	}
 
 	v := l[0].(map[string]interface{})
-	return v1alpha2.SimpleConfigOptionsRuntime{
+	return v1alpha4.SimpleConfigOptionsRuntime{
 		AgentsMemory:  v["agents_memory"].(string),
 		GPURequest:    v["gpu_request"].(string),
 		ServersMemory: v["servers_memory"].(string),
 	}
 }
 
-func expandEnvVars(l []interface{}) []v1alpha2.EnvVarWithNodeFilters {
+func expandEnvVars(l []interface{}) []v1alpha4.EnvVarWithNodeFilters {
 	if len(l) == 0 || l[0] == nil {
 		return nil
 	}
 
-	envVars := make([]v1alpha2.EnvVarWithNodeFilters, 0, len(l))
+	envVars := make([]v1alpha4.EnvVarWithNodeFilters, 0, len(l))
 	for _, i := range l {
 		v := i.(map[string]interface{})
-		envVars = append(envVars, v1alpha2.EnvVarWithNodeFilters{
+		envVars = append(envVars, v1alpha4.EnvVarWithNodeFilters{
 			EnvVar:      fmt.Sprintf("%s=%s", v["key"].(string), v["value"].(string)),
 			NodeFilters: expandNodeFilters(v["node_filters"].([]interface{})),
 		})
@@ -617,11 +629,11 @@ func expandEnvVars(l []interface{}) []v1alpha2.EnvVarWithNodeFilters {
 	return envVars
 }
 
-func expandExposureOptions(l []interface{}) v1alpha2.SimpleExposureOpts {
+func expandExposureOptions(l []interface{}) v1alpha4.SimpleExposureOpts {
 	freePort, _ := util.GetFreePort()
 
 	if len(l) == 0 || l[0] == nil {
-		return v1alpha2.SimpleExposureOpts{
+		return v1alpha4.SimpleExposureOpts{
 			HostPort: fmt.Sprintf("%d", freePort),
 		}
 	}
@@ -633,22 +645,22 @@ func expandExposureOptions(l []interface{}) v1alpha2.SimpleExposureOpts {
 		hostPort = freePort
 	}
 
-	return v1alpha2.SimpleExposureOpts{
+	return v1alpha4.SimpleExposureOpts{
 		Host:     v["host"].(string),
 		HostIP:   v["host_ip"].(string),
 		HostPort: fmt.Sprintf("%d", hostPort),
 	}
 }
 
-func expandLabels(l []interface{}) []v1alpha2.LabelWithNodeFilters {
+func expandLabels(l []interface{}) []v1alpha4.LabelWithNodeFilters {
 	if len(l) == 0 || l[0] == nil {
 		return nil
 	}
 
-	labels := make([]v1alpha2.LabelWithNodeFilters, 0, len(l))
+	labels := make([]v1alpha4.LabelWithNodeFilters, 0, len(l))
 	for _, i := range l {
 		v := i.(map[string]interface{})
-		labels = append(labels, v1alpha2.LabelWithNodeFilters{
+		labels = append(labels, v1alpha4.LabelWithNodeFilters{
 			Label:       fmt.Sprintf("%s=%s", v["key"].(string), v["value"].(string)),
 			NodeFilters: expandNodeFilters(v["node_filters"].([]interface{})),
 		})
@@ -670,15 +682,15 @@ func expandNodeFilters(l []interface{}) []string {
 	return filters
 }
 
-func expandPorts(l []interface{}) []v1alpha2.PortWithNodeFilters {
+func expandPorts(l []interface{}) []v1alpha4.PortWithNodeFilters {
 	if len(l) == 0 || l[0] == nil {
 		return nil
 	}
 
-	ports := make([]v1alpha2.PortWithNodeFilters, 0, len(l))
+	ports := make([]v1alpha4.PortWithNodeFilters, 0, len(l))
 	for _, i := range l {
 		v := i.(map[string]interface{})
-		ports = append(ports, v1alpha2.PortWithNodeFilters{
+		ports = append(ports, v1alpha4.PortWithNodeFilters{
 			Port:        fmt.Sprintf("%s:%d:%d/%s", v["host"].(string), v["host_port"].(int), v["container_port"].(int), v["protocol"].(string)),
 			NodeFilters: expandNodeFilters(v["node_filters"].([]interface{})),
 		})
@@ -687,12 +699,12 @@ func expandPorts(l []interface{}) []v1alpha2.PortWithNodeFilters {
 	return ports
 }
 
-func expandVolumes(l []interface{}) []v1alpha2.VolumeWithNodeFilters {
+func expandVolumes(l []interface{}) []v1alpha4.VolumeWithNodeFilters {
 	if len(l) == 0 || l[0] == nil {
 		return nil
 	}
 
-	volumes := make([]v1alpha2.VolumeWithNodeFilters, 0, len(l))
+	volumes := make([]v1alpha4.VolumeWithNodeFilters, 0, len(l))
 	for _, i := range l {
 		v := i.(map[string]interface{})
 
@@ -701,7 +713,7 @@ func expandVolumes(l []interface{}) []v1alpha2.VolumeWithNodeFilters {
 			volume = fmt.Sprintf("%s:%s", v["source"].(string), v["destination"].(string))
 		}
 
-		volumes = append(volumes, v1alpha2.VolumeWithNodeFilters{
+		volumes = append(volumes, v1alpha4.VolumeWithNodeFilters{
 			Volume:      volume,
 			NodeFilters: expandNodeFilters(v["node_filters"].([]interface{})),
 		})
